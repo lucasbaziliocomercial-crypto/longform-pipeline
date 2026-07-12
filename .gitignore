@@ -1,0 +1,70 @@
+# =========================================================================
+#  .gitignore — repo PÚBLICO com SÓ o código/workflow long-form.
+#  Estratégia ALLOWLIST: ignora TUDO por padrão e libera só o necessário.
+#  Assim nenhum vídeo (394 GB), node_modules, .env ou sessão entra por acidente.
+# =========================================================================
+
+# --- 1) ignora tudo na raiz ---
+/*
+
+# --- 2) libera só o que deve ir pro editor ---
+!/.gitignore
+!/CLAUDE.md
+!/README.md
+!/longform/
+
+# =========================================================================
+#  Dentro de longform/, corta as SAÍDAS pesadas e os SEGREDOS.
+# =========================================================================
+
+# saídas de vídeo / entregas (centenas de GB)
+longform/projects/
+longform/ENTREGAS/
+longform/VIDEOS-PRONTOS/
+longform/_logs/
+longform/_backup_codigo_pre_dynamic_2026-06-20/
+
+# dependências e artefatos de build (reinstaláveis)
+longform/**/node_modules/
+longform/**/__pycache__/
+longform/**/out/
+longform/**/dist/
+longform/remotion/public/
+
+# SEGREDOS — nunca versionar (o .example fica como template)
+longform/longform.env
+longform/tts/CapCut-TTS/.env
+longform/tts/CapCut-TTS/capcut-session.json
+longform/tts/CapCut-TTS/capcut-session.json.bak
+
+# CapCut-TTS é um sub-repo git próprio (Express wrapper, provider de FALLBACK) +
+# contém .env/sessão logada. Fica FORA deste repo público.
+longform/tts/CapCut-TTS/
+
+# estado de runtime da publicação (fila/testes), não é código
+longform/publicacao/
+
+# =========================================================================
+#  Mídia pesada em qualquer lugar (o código não precisa dela).
+# =========================================================================
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.avi
+*.mp3
+*.wav
+*.flac
+*.m4a
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.psd
+*.pdf
+
+# lixo de sistema / cache
+*.pyc
+.DS_Store
+Thumbs.db
