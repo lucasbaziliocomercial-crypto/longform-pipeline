@@ -122,10 +122,39 @@ def espaco_min():
     return max(1, m)
 
 
+def jitter_min():
+    """Amplitude do 'jitter' humano (± minutos) somado a cada slot p/ o horário não sair
+    robótico/cravado (18:00, 18:10…) e sim 'humano' (17:57, 18:06…). Env LONGFORM_PUB_JITTER_MIN
+    (default 4; 0 desliga). É CAPADO em `espaco_min()//2 - 1` p/ o jitter nunca embaralhar a
+    grade — assim o índice do slot ainda é recuperável do ledger (ver `_indice_no_dia`)."""
+    try:
+        j = int(os.environ.get("LONGFORM_PUB_JITTER_MIN", "4"))
+    except ValueError:
+        j = 4
+    return max(0, min(j, max(0, espaco_min() // 2 - 1)))
+
+
+def _com_jitter(slot, cat):
+    """Desloca `slot` em ± jitter_min minutos de forma DETERMINÍSTICA por (canal, dia, índice).
+    Determinístico de propósito: um `--dry-run` e a rodada real mostram o MESMO horário (nada de
+    o vídeo agendar num minuto e o ledger gravar outro), mas cada slot parece humano. O RNG aqui
+    é próprio (semeado), separado do RNG de sessão do humano.py."""
+    j = jitter_min()
+    if j <= 0:
+        return slot
+    idx = _indice_no_dia(slot)
+    semente = "%s|%s|%d" % (categorias.resolver(cat), slot.date().isoformat(), idx)
+    import random
+    off = random.Random(semente).randint(-j, j)
+    return slot + timedelta(minutes=off)
+
+
 def descrever_cadencia():
-    """Frase curta da cadência atual (p/ logar no início do drain). Ex.: '3/dia, 1 a cada 10 min, 18:00 US/Pacific'."""
-    return "%d/dia, 1 a cada %d min, a partir das %02d:00 %s" % (
-        por_dia(), espaco_min(), hora(), agora().tzname())
+    """Frase curta da cadência atual (p/ logar no início do drain). Ex.: '3/dia, 1 a cada 10 min, 18:00 US/Pacific (jitter ±4min)'."""
+    j = jitter_min()
+    extra = (" (jitter ±%dmin)" % j) if j else ""
+    return "%d/dia, 1 a cada %d min, a partir das %02d:00 %s%s" % (
+        por_dia(), espaco_min(), hora(), agora().tzname(), extra)
 
 
 def agora():
@@ -200,9 +229,10 @@ def proximo_slot(cat, seed=None):
             base = seed
 
     piso = _na_hora((agora() + timedelta(days=1)).date(), 0)   # amanhã, 1º slot
-    if base is None:
-        return piso
-    return max(_proximo_apos(base), piso)
+    grade = piso if base is None else max(_proximo_apos(base), piso)
+    alvo = _com_jitter(grade, cat)
+    # jitter negativo nunca pode furar o piso (YouTube exige data futura) — se furar, usa a grade.
+    return alvo if alvo >= piso else grade
 
 
 def _cli():

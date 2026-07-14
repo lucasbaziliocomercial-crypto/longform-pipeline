@@ -46,6 +46,15 @@ SPACES_PADRAO = "Selena,Selena 2"
 # CSV. Sobrescrevível por LONGFORM_CLICKUP_SKIP_STATUS.
 SKIP_STATUS_PADRAO = "canal,infoproduto,publicar"
 
+# Allow-list POSITIVA por NOME de status (case-insensitive): quando definida, SÓ os cards cujo
+# status casa aparecem no dropdown da esteira — todo o resto (to do, em produção, publicar, etc.)
+# some. É o contrato "o card só entra na automação quando está em TEMAS": a produtora arrasta o
+# card p/ 'temas' quando quer produzir; a esteira mostra só esses; ao terminar, ela move p/
+# 'publicar' e o card SAI da automação. 2026-07-13.
+# Vazio/none/all/* = desliga a allow-list (volta ao comportamento antigo: tudo que não é
+# done/skip). CSV. Sobrescrevível por LONGFORM_CLICKUP_ONLY_STATUS.
+ONLY_STATUS_PADRAO = "temas"
+
 # Prefixo do conector ClickUp do login do Claude (mesmo que a Etapa 1 usa) — só p/ o
 # fallback SEM token, via `claude -p` headless.
 CLICKUP_MCP = os.environ.get("LONGFORM_CLICKUP_MCP", "mcp__claude_ai_ClickUp")
@@ -90,6 +99,24 @@ def _skip_status():
 def _pular_status(item):
     """True se o card é de gestão do canal (status fora de produção) — some do dropdown."""
     return (item.get("status") or "").casefold() in _skip_status()
+
+
+def _only_status():
+    """Conjunto (casefold) de status PERMITIDOS na esteira. Vazio = allow-list desligada.
+    Default = 'temas'. LONGFORM_CLICKUP_ONLY_STATUS='' (ou 'none'/'all'/'*') desliga e volta a
+    mostrar tudo que não é done/skip."""
+    bruto = os.environ.get("LONGFORM_CLICKUP_ONLY_STATUS")
+    if bruto is None:
+        bruto = ONLY_STATUS_PADRAO
+    if bruto.strip().casefold() in ("", "none", "all", "*"):
+        return set()
+    return {s.casefold() for s in _csv(bruto)}
+
+
+def _status_permitido(item):
+    """True se o card passa na allow-list de status (ou se ela está desligada)."""
+    perm = _only_status()
+    return not perm or (item.get("status") or "").casefold() in perm
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +281,8 @@ def listar_videos_disponiveis():
     se LONGFORM_CLICKUP_LIST estiver definido, restringe àquela List.
 
     Cada item: {"id", "name", "url", "status", "status_type", "space"}.
-    Cards cujo status é do tipo 'done'/'closed' são OMITIDOS. Dedup por id."""
+    Cards cujo status é do tipo 'done'/'closed' são OMITIDOS. Se a allow-list de status estiver
+    ligada (default = só 'temas'), os fora dela também são OMITIDOS. Dedup por id."""
     if not _tem_token():
         raise ErroPipeline(
             "Token do ClickUp não configurado. Coloque LONGFORM_CLICKUP_TOKEN=pk_... em "
@@ -264,7 +292,8 @@ def listar_videos_disponiveis():
     brutos = _listar_por_list(resolver_list_id()) if _list_ref() else _listar_por_spaces()
     vistos, out = set(), []
     for it in brutos:
-        if _concluido(it) or _pular_status(it) or not it.get("id") or it["id"] in vistos:
+        if (_concluido(it) or _pular_status(it) or not _status_permitido(it)
+                or not it.get("id") or it["id"] in vistos):
             continue
         vistos.add(it["id"])
         out.append(it)
@@ -355,7 +384,7 @@ def listar_videos_via_connector(log=None, cancel=None):
     vistos, out = set(), []
     for v in dados.get("videos", []):
         vid, nome = v.get("id"), (v.get("name") or "").strip()
-        if not nome or vid in vistos or _pular_status(v):
+        if not nome or vid in vistos or _pular_status(v) or not _status_permitido(v):
             continue
         vistos.add(vid)
         out.append({"id": vid, "name": nome, "url": v.get("url"),

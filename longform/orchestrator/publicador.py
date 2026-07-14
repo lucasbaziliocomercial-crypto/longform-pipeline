@@ -48,6 +48,7 @@ import adspower
 import agenda
 import categorias
 import gates
+import humano
 
 try:
     from playwright.sync_api import sync_playwright
@@ -140,7 +141,13 @@ def _subir_no_studio(page, item, meta, slot, log, dry_run=False):
 
     log("    → abrindo o Studio…")
     page.goto(STUDIO_URL, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_timeout(3000)
+    humano.pausa(page, 2200, 4200)
+    # WARM-UP + HEALTH-CHECK: se o perfil não caiu logado no Studio, quase sempre é proxy/sessão
+    # fora — melhor PULAR o canal (o item fica na fila) do que forçar upload com o proxy ruim.
+    if "studio.youtube.com" not in page.url:
+        raise ErroPipeline("perfil não caiu logado no Studio (proxy/sessão fora?): %s" % page.url)
+    humano.scroll_leve(page)          # gesto humano: rola um pouco a home antes de agir
+    humano.pausa(page, 800, 2000)
     _shot(page, "studio_home")
 
     # CREATE → Upload videos. O botão de upload usa um <input type=file> escondido — muitas vezes
@@ -291,10 +298,11 @@ def _preencher_editbox(page, labels, valor, log, rotulo):
         try:
             campo = page.get_by_label(lab, exact=False).first
             campo.click(timeout=6000)
-            # contenteditable: limpa e digita
+            humano.pausa(page, 250, 700)
+            # contenteditable: limpa e digita (com cadência humana — ver humano.digitar)
             page.keyboard.press("Control+A")
             page.keyboard.press("Delete")
-            campo.type(valor, delay=5)
+            humano.digitar(page, campo, valor)
             log("    → %s preenchido." % rotulo)
             return
         except Exception:
@@ -519,10 +527,12 @@ def drenar(no_gates=False, dry_run=False, slug=None, log=print, cancel=None):
         return 0
     log("Fila: %d item(ns) pendente(s). Cadência: %s." % (len(itens), agenda.descrever_cadencia()))
     ok = 0
-    for item in itens:
+    for i, item in enumerate(itens):
         if cancel is not None and getattr(cancel, "is_set", lambda: False)():
             log("Cancelado — interrompendo a publicação (itens restantes ficam na fila).")
             break
+        if i > 0:
+            humano.descanso(log, pular=dry_run)  # nunca abrir dois perfis AdsPower colados
         try:
             if _publicar_item(item, log, no_gates=no_gates, dry_run=dry_run):
                 ok += 1
