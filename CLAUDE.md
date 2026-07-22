@@ -245,3 +245,16 @@ When you change `mapping.json`'s shape, update [build-mapping.py](longform/orche
   while one is live is **refused** (running/continuing the same card twice corrupts shared outputs
   like two `remotion render` writing the same `video_mudo.mp4`). Stale locks (dead PID) are
   auto-overwritten. Don't remove this without another guard.
+- **Verificar antes de entregar.** Toda correção de código (orchestrator, helpers `.py`,
+  Remotion/TS, skills) precisa passar pelo subagente
+  [`verificador-correcoes`](.claude/agents/verificador-correcoes.md) ANTES de ser reportada
+  como pronta: ele analisa o diff e **executa de verdade** (`py_compile`/import, `npm run
+  typecheck`, etapa da esteira via `./longform-mac.sh --slug <slug> N`, `--doctor`, inspeção
+  do artefato de saída e teste de idempotência) e só libera com a evidência real da execução
+  colada. Nada de "deve funcionar" — sem prova de execução, a correção não está verificada.
+- **Corrigir pela raiz, sempre.** Todo bug se conserta na causa (a etapa/função/dado que o
+  origina), nunca com remendo que só cala o sintoma (except que engole erro, `if` defensivo
+  mascarando `None`, valor chumbado, retry disfarçando corrida, editar o artefato à mão em vez
+  da etapa que o gera). O `verificador-correcoes` **reprova** remendo mesmo com teste verde e
+  exige que a correção reproduza a condição original e prove que o problema não volta. Isso é o
+  que destrava a automação de vez em vez de recair no mesmo defeito.

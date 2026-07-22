@@ -27,6 +27,7 @@ from stages import (s1_clickup, s2_roteiro, s3_validar, s4_narracao_srt,
                     s5_prompts_img, s6_thumbnails, s7_imagens, s8_montagem,
                     s9_publicacao)
 import gates
+import runner
 
 TODAS = (1, 2, 3, 4, 5, 6, 7, 8, 9)
 
@@ -216,6 +217,7 @@ def pipeline(alvo=None, etapas=TODAS, log=print, cancel=None, *,
              on_proj=None, refazer=False, roteiro_pronto=False):
     etapas = set(etapas)
     t0 = time.time()
+    runner.metricas_reset()  # zera o medidor de gasto deste run (resumo impresso no fim)
 
     # Categoria (= franquia/board do ClickUp): restringe a fonte de cards à List dela.
     cat = categorias.aplicar(categoria)
@@ -318,6 +320,13 @@ def pipeline(alvo=None, etapas=TODAS, log=print, cancel=None, *,
         log("⏱ Tempo total: %.0f s (%.1f min)" % (dt, dt / 60.0))
         return proj
     finally:
+        # Resumo de gasto de modelo do run (sai mesmo se uma etapa falhar/cancelar — assim você
+        # vê o que já gastou antes de quebrar). Medição NUNCA derruba o run.
+        try:
+            for _l in runner.formatar_resumo_custo():
+                log(_l)
+        except Exception:  # noqa: BLE001
+            pass
         _liberar_lock(lock)
 
 

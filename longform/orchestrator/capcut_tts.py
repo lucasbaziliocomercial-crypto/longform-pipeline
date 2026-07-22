@@ -72,6 +72,40 @@ def _esta_no_ar(base, timeout=3):
         return False
 
 
+def _ler_tail(caminho, n=12):
+    """Últimas `n` linhas de um log (p/ surgir o erro REAL do sidecar quando ele morre)."""
+    try:
+        linhas = Path(caminho).read_text(encoding="utf-8", errors="replace").splitlines()
+        return "\n".join(linhas[-n:]).strip() or "(log vazio)"
+    except OSError:
+        return "(sem log)"
+
+
+def _garantir_deps_sidecar(sidecar_dir, creation, log=_log):
+    """Garante as deps Node do sidecar ANTES de tentar subir.
+
+    Num clone recém-copiado o `node_modules` NÃO vem junto, então `npm run dev` cai em
+    `tsx: command not found`, o processo morre na hora e o sidecar nunca sobe — a Etapa 4
+    então esperava 180s à toa e abortava com um erro genérico, obrigando a rodar
+    `npm install` na mão e recomeçar. Aqui rodamos `npm install` UMA vez, de forma
+    idempotente (pula se o tsx já está instalado), então o sidecar passa a subir sozinho
+    no primeiro uso de qualquer clone."""
+    if (sidecar_dir / "node_modules" / "tsx").is_dir():
+        return
+    log("▶ Sidecar CapCut-TTS sem node_modules (clone novo) — rodando `npm install` "
+        "uma vez (pode levar ~1 min)...")
+    with open(sidecar_dir / "sidecar.log", "ab") as log_out:
+        subprocess.run("npm install", cwd=str(sidecar_dir), shell=True,
+                       stdout=log_out, stderr=log_out, creationflags=creation)
+    if not (sidecar_dir / "node_modules" / "tsx").is_dir():
+        raise SystemExit(
+            "ERRO: `npm install` no sidecar CapCut-TTS não instalou o tsx. Verifique se o "
+            "Node.js/npm estão no PATH e rode manualmente: cd %s && npm install\n"
+            "Últimas linhas do log:\n%s"
+            % (sidecar_dir, _ler_tail(sidecar_dir / "sidecar.log")))
+    log("    ✓ deps do sidecar instaladas (npm install).")
+
+
 def _subir_sidecar(sidecar_dir, base, espera_s=180, log=_log):
     """Sobe `npm run dev` destacado e espera o /v2/speakers responder 200 (login + warmup)."""
     env_file = sidecar_dir / ".env"
@@ -86,7 +120,6 @@ def _subir_sidecar(sidecar_dir, base, espera_s=180, log=_log):
                 "ERRO: CAPCUT_EMAIL/CAPCUT_PASSWORD vazios em %s. Preencha as duas linhas e rode de novo." % env_file
             )
 
-    log("▶ Subindo sidecar CapCut-TTS (npm run dev) em %s ..." % sidecar_dir)
     creation = 0
     if os.name == "nt":
         # CREATE_NO_WINDOW esconde a janela preta de console que o npm/node abriria
@@ -96,8 +129,13 @@ def _subir_sidecar(sidecar_dir, base, espera_s=180, log=_log):
         # e segue no ar como server. Os logs continuam indo p/ sidecar.log — nada se perde.
         creation = (getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
                     | subprocess.CREATE_NEW_PROCESS_GROUP)
+
+    # Deps Node prontas antes de subir (senão `npm run dev` = 'tsx: command not found').
+    _garantir_deps_sidecar(sidecar_dir, creation, log=log)
+
+    log("▶ Subindo sidecar CapCut-TTS (npm run dev) em %s ..." % sidecar_dir)
     log_out = open(sidecar_dir / "sidecar.log", "ab")
-    subprocess.Popen(
+    proc = subprocess.Popen(
         "npm run dev",
         cwd=str(sidecar_dir),
         shell=True,
@@ -111,6 +149,14 @@ def _subir_sidecar(sidecar_dir, base, espera_s=180, log=_log):
         if _esta_no_ar(base):
             log("    ✓ sidecar no ar (%.0fs)." % (time.time() - t0))
             return
+        # Não esperar 180s cego: se o processo do sidecar MORREU no boot (erro de deps,
+        # login, porta ocupada...), falhar NA HORA com o erro real do log — em vez de
+        # torrar o timeout inteiro e devolver uma mensagem genérica.
+        if proc.poll() is not None:
+            raise SystemExit(
+                "ERRO: o sidecar CapCut-TTS morreu ao subir (código %s, %.0fs). "
+                "Últimas linhas do log:\n%s"
+                % (proc.returncode, time.time() - t0, _ler_tail(sidecar_dir / "sidecar.log")))
         time.sleep(3)
     raise SystemExit(
         "ERRO: sidecar não respondeu em %ds. Veja %s para o log de login/erros."

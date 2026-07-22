@@ -12,6 +12,8 @@ não estiver instalado ou a conversão falhar, segue só com o .docx (que já sa
 Regenera só quando o roteiro.txt é mais novo que o .docx (idempotente, mas sempre atual).
 """
 
+from __future__ import annotations  # tipos 'X | None' em Python 3.9 (macOS)
+
 import sys
 from pathlib import Path
 

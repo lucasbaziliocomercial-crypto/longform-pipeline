@@ -52,6 +52,14 @@ def _envf(nome, default):
         return float(default)
 
 
+def _manter_intermedios():
+    """Mantém os intermediários da montagem (out/_ffmpeg: clipes por take + video.mp4 mudo)
+    quando LONGFORM_KEEP_INTERMEDIOS=1/on/true — útil p/ depurar um take. Default = limpar,
+    para sobrar só o vídeo final (economiza ~2 GB por vídeo)."""
+    v = os.environ.get("LONGFORM_KEEP_INTERMEDIOS", "0").strip().lower()
+    return v in ("1", "on", "true", "sim", "yes")
+
+
 # Amplitude do movimento. O ciclo de Ken Burns roda uma vez POR SUB-TAKE — o build-mapping.py
 # fatia cada imagem em sub-takes de ~LONGFORM_TAKE_SEC s (default 30), então a amplitude abaixo
 # é percorrida nesses ~30 s (não mais espalhada pelos ~3,7 min da imagem inteira, onde sumia).
@@ -419,12 +427,16 @@ def _expr_pan(px, n, dim_iw, half_margin_expr):
     return "%s%s%s*%s*%s" % (centro, sinal, half_margin_expr, PAN_FRAC, _ease(n))
 
 
-def _filtro_segmento(seg, fps, w, h, ass_name=None):
+def _filtro_segmento(seg, fps, w, h, ass_name=None, primeiro=False):
     """Filtergraph de um take: upscale -> zoompan (Ken Burns) -> fade in/out [-> legenda] -> yuv420p.
 
     `ass_name` (opcional): nome RELATIVO de um .ass já recortado/deslocado para este take — quando
     presente, a legenda é queimada AQUI mesmo (sobre o frame de saída 1920x1080, depois do zoompan),
     eliminando o 2º encode do vídeo inteiro. O comando precisa rodar com cwd na pasta do .ass.
+
+    `primeiro`: quando True (take de índice 0), o fade-in a partir do preto é OMITIDO — o vídeo
+    abre já na 1ª imagem (a capa/thumb = img_000), sem o frame preto de abertura. O fade-out (e os
+    fades entre os demais takes) seguem intactos, preservando a transição dip-to-black do resto.
     """
     n = max(1, int(seg["durationInFrames"]))
     effect = seg.get("effect", "zoomIn")
@@ -443,7 +455,8 @@ def _filtro_segmento(seg, fps, w, h, ass_name=None):
     ]
     if n > FADE:
         st_out = (n - FADE) / float(fps)
-        partes.append("fade=t=in:st=0:d=%.4f:color=black" % (FADE / float(fps)))
+        if not primeiro:
+            partes.append("fade=t=in:st=0:d=%.4f:color=black" % (FADE / float(fps)))
         partes.append("fade=t=out:st=%.4f:d=%.4f:color=black" % (st_out, FADE / float(fps)))
     # Motion-blur temporal ANTES da legenda (a legenda é estática → fica nítida; só o pan/zoom
     # ganha o blur que funde a tremida do arredondamento do zoompan a fps baixo).
@@ -560,7 +573,7 @@ def construir(pasta, out=None, com_audio=True, srt=None):
             (tmp / ass_name).write_text(_ass_take_text(cap_txt, start_sec, n / float(fps)),
                                         encoding="utf-8")
             cwd = str(tmp)
-        filtro = _filtro_segmento(seg, fps, w, h, ass_name)
+        filtro = _filtro_segmento(seg, fps, w, h, ass_name, primeiro=(i == 0))
         # Em CPU rodamos MUITOS takes em paralelo (ver _paralelo); pra não oversubscrever,
         # cada take fica preso a 1 thread de filtro+encode → 1 take ≈ 1 núcleo. Em GPU não
         # mexemos (o zoompan é single-thread e o NVENC encoda na placa; deixar livre é melhor).
@@ -649,6 +662,19 @@ def construir(pasta, out=None, com_audio=True, srt=None):
     total = m.get("totalSeconds", 0)
     print("base.mp4: %d takes, %.1f s (%.1f min). Salvo em: %s"
           % (len(clips), total, total / 60.0, out), flush=True)
+
+    # 4) Limpa os intermediários (out/_ffmpeg: clipes seg_NNN.mp4 por take + video.mp4 mudo +
+    #    concat.txt/.ass). São scratch — recriados a cada montagem, NÃO entram na idempotência
+    #    (que é da Etapa 8, que pula se o final já existe). Só apaga depois que o `out` final
+    #    saiu de fato; economiza ~2 GB por vídeo, deixando só o vídeo final. Debug: manter com
+    #    LONGFORM_KEEP_INTERMEDIOS=1. Best-effort: falha na limpeza NÃO derruba a montagem.
+    if out.is_file() and out.stat().st_size > 0 and not _manter_intermedios():
+        try:
+            shutil.rmtree(tmp, ignore_errors=True)
+            print(">> Intermediários da montagem removidos (out/_ffmpeg) — só o vídeo final ficou.",
+                  flush=True)
+        except OSError as e:
+            print("AVISO: não consegui limpar out/_ffmpeg (%s) — pode apagar à mão." % e, flush=True)
 
 
 def _dividir_legenda(texto, maximo):

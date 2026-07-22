@@ -3,11 +3,12 @@
 
 É o worker à parte da Etapa 9: a Etapa 9 só enfileira (publicacao/fila/<slug>.json); aqui a
 gente drena a fila. Para cada item pendente:
-  1. calcula o próximo slot do canal (agenda.py: 1/dia, 18h US Pacific por padrão);
+  1. calcula o próximo slot do canal (agenda.py: 3/dia, 18h US Pacific por padrão);
   2. Gate 3 (painel) p/ você revisar/editar título/descrição/tags e aprovar (a menos de --no-gates);
   3. abre o PERFIL do canal no AdsPower (adspower.py) e conecta o Playwright no Chromium logado;
   4. sobe o vídeo no YouTube Studio, preenche metadados, marca "not made for kids", adiciona a
-     TELA FINAL ("best for viewer") + CARDS (últimos vídeos do canal) e AGENDA no slot;
+     TELA FINAL ("best for viewer") + CARDS (últimos vídeos do canal), ESPERA o arquivo terminar
+     de subir (ver `_esperar_upload`) e só então AGENDA no slot;
   5. reserva o slot no ledger do canal e marca o item como publicado.
 
 Cadência do agendamento (agenda.py): por padrão 3 vídeos/dia espaçados 10 min por canal
@@ -34,6 +35,7 @@ Uso:
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -126,6 +128,86 @@ def _shot(page, tag):
 def _clicar_texto(page, texto, timeout=15000):
     """Clica no primeiro elemento clicável que contém `texto` (case-insensitive)."""
     page.get_by_text(texto, exact=False).first.click(timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
+# Espera do UPLOAD — o passo que faltava (bug histórico)
+# ---------------------------------------------------------------------------
+#
+# O Studio mostra o andamento do envio num rótulo próprio: "Uploading 45% … 3 minutes left",
+# depois "Upload complete …" / "Processing …". Enquanto disser "Uploading", o arquivo AINDA
+# está subindo — e fechar o perfil do AdsPower nesse momento ABORTA o envio.
+#
+# Antes desta função o publicador preenchia os metadados, clicava em Schedule, esperava 4s
+# fixos e encerrava o perfil. Isso só funcionava por SORTE: quando o upload terminava durante
+# os ~3 min de digitação. Com arquivo de ~1.5 GB em proxy residencial (10-40 min de envio) a
+# corrida se perde — e piora justamente ao escalar, quando mais uploads dividem a banda.
+_RE_SUBINDO = re.compile(r"\buploading\b", re.I)
+_RE_SUBIU = re.compile(r"upload complete|processing|checks complete|finished", re.I)
+# Seletores do rótulo de progresso (variam entre versões do Studio) — recalibre no --dry-run.
+_SEL_PROGRESSO = ("ytcp-video-upload-progress .progress-label",
+                  "ytcp-video-upload-progress",
+                  ".progress-label")
+
+
+def timeout_upload_min():
+    """Teto da espera do upload, em minutos (LONGFORM_PUB_UPLOAD_TIMEOUT_MIN, default 45)."""
+    try:
+        return max(1, int(os.environ.get("LONGFORM_PUB_UPLOAD_TIMEOUT_MIN", "45")))
+    except ValueError:
+        return 45
+
+
+def _rotulo_progresso(page):
+    """Texto do rótulo de progresso do upload; "" se nenhum seletor casar."""
+    for sel in _SEL_PROGRESSO:
+        try:
+            txt = (page.locator(sel).first.inner_text(timeout=2000) or "").strip()
+            if txt:
+                return txt
+        except Exception:  # noqa: BLE001 — seletor ausente nesta versão do Studio
+            continue
+    return ""
+
+
+def _esperar_upload(page, log):
+    """BLOQUEIA até o arquivo terminar de subir. Falha ALTO se não der p/ ter certeza.
+
+    Diferente de thumbnail/tags (best-effort, que só avisam), aqui NÃO é aceitável seguir na
+    dúvida: confirmar o agendamento e fechar o perfil com o envio pela metade deixa o vídeo
+    quebrado no canal. Sem o rótulo de progresso -> ErroPipeline e o item FICA na fila.
+    """
+    limite = timeout_upload_min() * 60
+    t0 = time.time()
+    ultimo_log = 0.0
+    visto = ""
+
+    while True:
+        txt = _rotulo_progresso(page)
+        if txt:
+            visto = txt
+            if _RE_SUBIU.search(txt) and not _RE_SUBINDO.search(txt):
+                log("    → upload concluído (%s)." % txt)
+                _shot(page, "upload_concluido")
+                return
+        decorrido = time.time() - t0
+        # Nenhum rótulo em 60s = seletor a recalibrar, não upload lento.
+        if not visto and decorrido > 60:
+            _shot(page, "erro_progresso_upload")
+            raise ErroPipeline(
+                "não achei o rótulo de progresso do upload no Studio (seletores testados: %s). "
+                "Rode `py -3 publicador.py --dry-run` e recalibre pelos screenshots — seguir sem "
+                "essa confirmação aborta uploads grandes no meio." % ", ".join(_SEL_PROGRESSO))
+        if decorrido > limite:
+            _shot(page, "erro_timeout_upload")
+            raise ErroPipeline(
+                "upload não terminou em %d min (último estado: %r). Suba "
+                "LONGFORM_PUB_UPLOAD_TIMEOUT_MIN ou investigue banda/proxy do perfil."
+                % (timeout_upload_min(), visto or "desconhecido"))
+        if decorrido - ultimo_log >= 30:
+            ultimo_log = decorrido
+            log("    … subindo (%s) — %ds" % (visto or "sem rótulo", int(decorrido)))
+        page.wait_for_timeout(3000)
 
 
 def _subir_no_studio(page, item, meta, slot, log, dry_run=False):
@@ -232,6 +314,12 @@ def _subir_no_studio(page, item, meta, slot, log, dry_run=False):
         _shot(page, "erro_schedule")
         raise ErroPipeline("não consegui abrir/definir o agendamento (Schedule): %s" % e)
     _shot(page, "schedule_preenchido")
+
+    # Só bloqueia AQUI, no último momento: os metadados acima foram preenchidos EM PARALELO ao
+    # envio do arquivo (esse tempo é de graça), então na prática costuma faltar pouco. O que não
+    # pode é confirmar o agendamento e fechar o perfil com o envio pela metade.
+    log("    → aguardando o upload terminar antes de confirmar…")
+    _esperar_upload(page, log)
 
     if dry_run:
         log("    [dry-run] parando ANTES de confirmar o agendamento (nada foi publicado).")

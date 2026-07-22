@@ -19,7 +19,10 @@ import os
 
 from runner import rodar_claude
 
-MODELO_QA = "opus"  # julgamento visual fino — vale Opus (é o "você aprova as thumbs")
+# QA da capa = checagem de RUBRICA visual (emoção, look do lead, capa clara, sem texto…). Era Opus;
+# Sonnet tem visão e resolve a rubrica cortando ~5× o custo. Falha graciosa: se reprovar, a capa vai
+# pro Gate 2 HUMANO (não auto-confirma). Reverta com LONGFORM_MODELO_QA=opus.
+MODELO_QA = os.environ.get("LONGFORM_MODELO_QA", "sonnet").strip() or "sonnet"
 
 
 def ligado():

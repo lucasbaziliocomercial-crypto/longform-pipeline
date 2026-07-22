@@ -34,6 +34,8 @@ Tudo aqui é idempotente: copia por cima sem reclamar, e arquivos que faltam só
 geram um aviso no log (o vídeo final é o único obrigatório).
 """
 
+from __future__ import annotations  # tipos 'X | None' em Python 3.9 (macOS)
+
 import json
 import os
 import re

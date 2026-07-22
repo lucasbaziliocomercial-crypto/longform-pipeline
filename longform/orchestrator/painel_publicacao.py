@@ -21,6 +21,8 @@ As thumbs são reduzidas (~480px, JPEG) e embutidas em base64, então o HTML é 
 Os links "abrir vídeo/pasta" usam caminho absoluto local (só valem nesta máquina).
 """
 
+from __future__ import annotations  # tipos 'X | None' em Python 3.9 (macOS)
+
 import base64
 import io
 import json

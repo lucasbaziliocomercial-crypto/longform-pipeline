@@ -21,9 +21,16 @@ MODELO_TRADUZIR = os.environ.get("LONGFORM_MODELO_TRADUZIR", "sonnet").strip() o
 # Caracteres típicos do português que praticamente não aparecem em inglês — base da detecção.
 _PT_CHARS = "ãõçáéíóúâêôàü"
 
-ALVO_PALAVRAS = 5000
-MIN_PALAVRAS = 4800     # faixa do prompt mestre Helô Stories: 4.800–5.200
-MAX_PALAVRAS = 5200
+# Alvo de tamanho do roteiro, configurável por env LONGFORM_ALVO_PALAVRAS (default 5000 = ~40 min
+# na voz natural da Joanne). Baixe (ex.: 3200 ≈ ~25 min) p/ vídeos mais curtos SEM acelerar a fala —
+# o TAMANHO do roteiro é o que controla a duração em ritmo natural. A skill recebe o alvo via
+# _ctx_base e mira ele na 1ª passada. MIN/MAX = faixa ±~6% (MIN é o piso do loop de expansão).
+try:
+    ALVO_PALAVRAS = max(500, int(os.environ.get("LONGFORM_ALVO_PALAVRAS", "5000")))
+except (TypeError, ValueError):
+    ALVO_PALAVRAS = 5000
+MIN_PALAVRAS = int(round(ALVO_PALAVRAS * 0.94))
+MAX_PALAVRAS = int(round(ALVO_PALAVRAS * 1.06))
 MAX_EXPANSOES = 1   # era 2. Cada expansão é um claude -p Opus completo (~6-9 min); a usuária
                     # priorizou velocidade. O _ctx_base agora exige acertar o tamanho NA 1ª passada,
                     # então 1 expansão é rede de segurança. Suba se o roteiro sair curto com frequência.
@@ -61,13 +68,25 @@ def _ctx_base(proj, alvo):
     )
 
 
+# Preâmbulo headless MÍNIMO para a expansão — de propósito NÃO carrega a skill de geração
+# (~5.600–7.000 tok em Opus): expandir é aprofundar cenas do roteiro que JÁ existe (o modelo lê
+# roteiro.txt, que já carrega o estilo), não reestabelecer o formato. Economia direta no tier caro.
+_PREAMBULO_EXPANSAO = (
+    "MODO AUTOMÁTICO (headless) — sem humano no chat. A PASTA DE TRABALHO é o diretório atual (.). "
+    "NÃO faça perguntas, NÃO pause. Edite/salve o arquivo pedido com Write/Edit.\n\n"
+)
+
+
 def _ctx_expandir(faltam, palavras_atual, alvo):
+    """Prompt AUTOCONTIDO da expansão (sem a skill de geração — só as regras de aprofundar)."""
     return (
-        "O roteiro.txt já existe mas está CURTO: %d palavras (alvo ~%d; faltam ~%d). "
-        "EXPANDA-O editando o próprio roteiro.txt: aprofunde as cenas mais rasas com "
-        "diálogo, tensão e detalhe sensorial — SEM enchimento, sem repetir parágrafos, "
-        "mantendo a continuidade e o tom. Não reescreva o que já está bom; só cresça o "
-        "que está corrido. Salve por cima (Write/Edit)."
+        _PREAMBULO_EXPANSAO +
+        "Tarefa: EXPANDIR o roteiro long-form que já está em `roteiro.txt` (romance, narração em "
+        "1ª pessoa da heroína). Ele está CURTO: %d palavras (alvo ~%d; faltam ~%d). ABRA `roteiro.txt` "
+        "com Read e EXPANDA-O editando o próprio arquivo: aprofunde as cenas mais rasas com diálogo, "
+        "tensão e detalhe sensorial — SEM enchimento, sem repetir parágrafos, mantendo a continuidade, "
+        "o tom e a 1ª pessoa. Não reescreva o que já está bom; só cresça o que está corrido. Salve por "
+        "cima (Write/Edit), texto puro, sem markdown."
         % (palavras_atual, alvo, faltam)
     )
 
@@ -99,8 +118,9 @@ def run(proj, log, cancel=None, alvo=ALVO_PALAVRAS, **_):
             log("    ✓ Roteiro com %d palavras (>= mínimo %d)." % (n, MIN_PALAVRAS))
             return
         faltam = alvo - n
-        log("    Roteiro curto (%d/%d). Expansão %d/%d..." % (n, alvo, tent + 1, MAX_EXPANSOES))
-        rodar_claude(montar_prompt(skill, _ctx_expandir(faltam, n, alvo)),
+        log("    Roteiro curto (%d/%d). Expansão %d/%d (prompt enxuto, sem reenviar a skill)..."
+            % (n, alvo, tent + 1, MAX_EXPANSOES))
+        rodar_claude(_ctx_expandir(faltam, n, alvo),
                      proj.dir, log, cancel, modelo=MODELO_ROTEIRO, effort=EFFORT_ROTEIRO)
 
     n = contar_palavras(proj.roteiro.read_text(encoding="utf-8", errors="replace"))

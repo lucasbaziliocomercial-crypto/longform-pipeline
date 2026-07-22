@@ -169,8 +169,60 @@ def forcar_utf8_console():
             pass
 
 
+_PATH_ENRIQUECIDO = False
+
+
+def _enriquecer_path():
+    """Enriquece o PATH do processo com os bin-dirs do usuário e o PATH do shell de login.
+
+    RAIZ do bug "Executável 'claude' não encontrado no PATH": um app aberto pelo
+    Finder/ícone .app (LaunchServices) NÃO herda o PATH do ~/.zshrc — recebe só o PATH
+    mínimo do macOS (/usr/bin:/bin:/usr/sbin:/sbin). Aí `shutil.which("claude")` falha,
+    embora o mesmo `claude` funcione no terminal (que carrega o .zshrc). Idem ffmpeg
+    (/opt/homebrew/bin) e node. Aqui, na 1ª descoberta de executável, adicionamos ao
+    os.environ["PATH"]: (1) os bin-dirs conhecidos do usuário e (2) o PATH do shell de
+    login (pega nvm/asdf/instalações custom). No Windows é no-op — lá o app já herda o
+    PATH completo do usuário. Idempotente (roda uma vez por processo)."""
+    global _PATH_ENRIQUECIDO
+    if _PATH_ENRIQUECIDO:
+        return
+    _PATH_ENRIQUECIDO = True
+    if os.name == "nt":
+        return
+    home = os.path.expanduser("~")
+    extras = [
+        os.path.join(home, ".local", "bin"),      # claude (instalação padrão do Claude Code)
+        os.path.join(home, ".claude", "local"),   # claude (instalação alternativa)
+        "/opt/homebrew/bin",                       # Homebrew (Apple Silicon): ffmpeg, node…
+        "/usr/local/bin",                          # Homebrew (Intel) / instalações manuais
+        os.path.join(home, ".npm-global", "bin"),  # npm global custom
+        os.path.join(home, "bin"),
+    ]
+    # PATH do shell de login — cobre nvm/asdf e instalações fora dos caminhos acima.
+    try:
+        shell = os.environ.get("SHELL") or "/bin/zsh"
+        saida = subprocess.run(
+            [shell, "-lic", "printf %s \"$PATH\""],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        if saida:
+            extras.extend(saida.split(os.pathsep))
+    except Exception:  # noqa: BLE001 — best-effort; se o shell falhar, ficam os extras fixos
+        pass
+    atual = os.environ.get("PATH", "").split(os.pathsep)
+    ja = set(atual)  # dedup contra o PATH atual E contra o que já acrescentamos
+    novos = []
+    for d in extras:
+        if d and d not in ja:
+            ja.add(d)
+            novos.append(d)
+    if novos:
+        os.environ["PATH"] = os.pathsep.join(atual + novos)
+
+
 def achar_claude():
     """Acha o executável do Claude Code. Retorna a lista-prefixo do comando."""
+    _enriquecer_path()
     for nome in ("claude", "claude.cmd", "claude.exe"):
         p = shutil.which(nome)
         if p:
@@ -192,6 +244,7 @@ def achar_python():
 
 def achar_ffmpeg():
     """Acha o executável do ffmpeg. Retorna o caminho (string)."""
+    _enriquecer_path()
     for nome in ("ffmpeg", "ffmpeg.exe"):
         p = shutil.which(nome)
         if p:
@@ -250,6 +303,10 @@ class Projeto:
     def narration_raw(self):    return self.dir / "narration_raw.mp3"      # Etapa 4 (TTS cru, pré-otimização de pausa)
     @property
     def pausas_flag(self):      return self.dir / ".pausas_otimizadas"     # Etapa 4 (marca: pausas já aparadas)
+    @property
+    def narration_semritmo(self): return self.dir / "narration_semritmo.mp3" # Etapa 4 (áudio antes do atempo — não-destrutivo)
+    @property
+    def ritmo_flag(self):       return self.dir / ".ritmo_ajustado"        # Etapa 4 (marca: atempo p/ alvo de minutos já aplicado)
     @property
     def narration_srt(self):    return self.dir / "narration.srt"          # Etapa 4
     @property

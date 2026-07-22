@@ -945,7 +945,13 @@ def rodar_gui(card_inicial=""):
             )
             return
         try:
-            os.startfile(str(alvo))  # noqa: S606  (Explorer do Windows)
+            import subprocess
+            if sys.platform.startswith("win"):
+                os.startfile(str(alvo))  # noqa: S606  (Explorer do Windows)
+            elif sys.platform == "darwin":
+                subprocess.run(["open", str(alvo)], check=True)  # Finder do macOS
+            else:
+                subprocess.run(["xdg-open", str(alvo)], check=True)  # Linux
             log("📂 Abrindo: %s" % alvo)
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("Erro", "Não consegui abrir a pasta:\n%s" % e)
@@ -1031,6 +1037,24 @@ def rodar_gui(card_inicial=""):
             root.iconbitmap(str(ico))
     except Exception:
         pass
+
+    # macOS/Tk 8.5: a janela às vezes abre "cinza" (widgets não pintam) até receber um
+    # evento de redraw. Forçamos: trazer pra frente + micro-resize (1px e volta) que dispara
+    # a repintura — assim o usuário não precisa arrastar o canto da janela. Best-effort.
+    def _forcar_redraw_macos():
+        try:
+            root.update_idletasks()
+            root.lift()
+            root.focus_force()
+            w, h = root.winfo_width(), root.winfo_height()
+            if w > 1 and h > 1:
+                root.geometry("%dx%d" % (w + 1, h + 1))
+                root.after(60, lambda: root.geometry("%dx%d" % (w, h)))
+            root.update()
+        except Exception:
+            pass
+    if sys.platform == "darwin":
+        root.after(150, _forcar_redraw_macos)
 
     root.mainloop()
 

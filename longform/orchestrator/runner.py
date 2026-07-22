@@ -31,8 +31,14 @@ _RE_ERRO_TRANSITORIO = re.compile(
 )
 
 # Tiering de modelo por etapa (mesma filosofia do TINAGO: qualidade onde importa).
-MODELO_ROTEIRO = "opus"     # geração criativa do roteiro de ~5.000 palavras
-MODELO_VALIDAR = "opus"     # validador-gate: nota + gravidade + auto-fix
+# CUSTO: cada sessão claude -p tem um piso fixo (~25k tok de system prompt + tools, medido
+# 2026-07-22) e Opus custa ~5× Sonnet por token. Por isso só o que exige julgamento criativo
+# fica em Opus; o resto desce pra Sonnet. Todos sobrescrevíveis por env (reverta se a qualidade cair).
+MODELO_ROTEIRO = os.environ.get("LONGFORM_MODELO_ROTEIRO", "opus").strip() or "opus"    # criação: Opus (qualidade do produto)
+# Validador = revisão ESTRUTURAL + auto-fix in-place. Era Opus e é a sessão Opus MAIS PESADA
+# (relê as ~5.000 palavras e reescreve em vários turnos). Sonnet dá conta da correção estrutural
+# e o gate de nota (META_SCORE) continua valendo. Reverta com LONGFORM_MODELO_VALIDAR=opus.
+MODELO_VALIDAR = os.environ.get("LONGFORM_MODELO_VALIDAR", "sonnet").strip() or "sonnet"
 MODELO_CLICKUP = "sonnet"   # leitura estruturada de card (mecânico)
 MODELO_PROMPTS = "sonnet"   # style bible + prompts de thumb
 MODELO_IMG_PROMPTS = "sonnet"  # derivar prompts de imagem a partir da thumb
@@ -120,6 +126,13 @@ def _dormir_cancelavel(segundos, cancel):
         time.sleep(min(0.5, restante))
 
 
+# Ferramentas que são PLUMBING do harness (não trabalho real da etapa): a descoberta de
+# ferramentas deferidas via ToolSearch. Quando o MCP tem muitas tools (ex.: as ~50 do
+# ClickUp), o modelo faz uma dança de ToolSearch antes de chamar a tool de verdade — isso
+# não deve poluir o LOG do painel (só as chamadas reais, tipo clickup_search, aparecem).
+_TOOLS_PLUMBING = {"ToolSearch"}
+
+
 def _resumir_linha(linha):
     s = linha.strip()
     if not (s.startswith("{") and s.endswith("}")):
@@ -138,19 +151,22 @@ def _resumir_linha(linha):
             return "⚠ limite de uso (%s): %s" % (info.get("rateLimitType", "?"), status)
         return None
     if tipo == "system":
-        return "(sessão iniciada)"
+        return None  # "(sessão iniciada)" era ruído — a Etapa já loga seu próprio cabeçalho ▶
     if tipo == "assistant":
         try:
             for b in ev["message"]["content"]:
                 if b.get("type") == "text" and b.get("text", "").strip():
                     return "assistant: " + b["text"].strip().replace("\n", " ")[:160]
                 if b.get("type") == "tool_use":
-                    return "tool: %s" % b.get("name", "?")
+                    nome = b.get("name", "?")
+                    if nome in _TOOLS_PLUMBING:
+                        return None  # descoberta de tools (ToolSearch) — plumbing, não trabalho real
+                    return "tool: %s" % nome
         except Exception:
             pass
-        return "(assistant)"
+        return None  # "(assistant)" vazio era ruído
     if tipo == "user":
-        return "(tool result)"
+        return None  # "(tool result)" era ruído — um por retorno de tool
     if tipo == "result":
         custo = ev.get("total_cost_usd")
         dur = ev.get("duration_ms")
@@ -193,6 +209,98 @@ def _extrair_result(linhas):
         if ev.get("type") == "result" or "total_cost_usd" in ev or "result" in ev:
             return ev
     return {}
+
+
+# ---------------------------------------------------------------------------
+# Medição de gasto (só NOÇÃO — não altera comportamento) — 2026-07-22
+# ---------------------------------------------------------------------------
+# Cada `claude -p` é um agente completo; o `result` event já traz custo/tokens/duração.
+# Acumulamos aqui (ponto ÚNICO por onde TODA sessão passa) para o pipeline imprimir um
+# resumo no fim. Acumulador GLOBAL do processo: assume um pipeline() por vez (mesmo
+# contrato do lock "uma execução por projeto"); pipeline() chama metricas_reset() no início.
+_METRICAS = []
+
+
+def metricas_reset():
+    """Zera o acumulador do run (chamado no início de pipeline())."""
+    _METRICAS.clear()
+
+
+def metricas():
+    """Cópia da lista de métricas por sessão coletadas até agora."""
+    return list(_METRICAS)
+
+
+def _registrar_metrica(res, modelo):
+    """Acumula custo/tokens/duração de UMA sessão claude -p a partir do seu result event.
+
+    Chamado a CADA tentativa que produziu um result — inclusive uma que falhou DEPOIS de já
+    ter consumido tokens (retry transitório), pra a 'noção de gasto' não subestimar. Ignora
+    sessões sem result (crash cedo, sem custo a medir)."""
+    if not isinstance(res, dict):
+        return
+    custo = res.get("total_cost_usd")
+    uso = res.get("usage") or {}
+    if custo is None and not uso:
+        return
+    _METRICAS.append({
+        "modelo": modelo or "default",
+        "cost": float(custo) if isinstance(custo, (int, float)) else 0.0,
+        "dur_ms": res.get("duration_ms") or 0,
+        "in": uso.get("input_tokens") or 0,
+        "out": uso.get("output_tokens") or 0,
+        "cache_read": uso.get("cache_read_input_tokens") or 0,
+        "cache_cria": uso.get("cache_creation_input_tokens") or 0,
+    })
+
+
+def _fmt_tok(x):
+    """Formata contagem de tokens compacta (1.2M / 48k / 512)."""
+    x = int(x or 0)
+    if x >= 1_000_000:
+        return "%.1fM" % (x / 1_000_000.0)
+    if x >= 1000:
+        return "%.0fk" % (x / 1000.0)
+    return str(x)
+
+
+def formatar_resumo_custo():
+    """Linhas de resumo do gasto de modelo do run atual, agrupado por modelo. Lista vazia se
+    nenhuma sessão claude -p rodou (ex.: só etapas de montagem FFmpeg). O custo é o
+    `total_cost_usd` que o CLI reporta — no login/assinatura ele é EQUIVALENTE a list price
+    (proxy de gasto), não uma cobrança real."""
+    if not _METRICAS:
+        return []
+    por_modelo = {}
+    for m in _METRICAS:
+        g = por_modelo.setdefault(m["modelo"],
+                                  {"n": 0, "cost": 0.0, "dur_ms": 0, "in": 0, "out": 0,
+                                   "cr": 0, "cc": 0})
+        g["n"] += 1
+        g["cost"] += m["cost"]
+        g["dur_ms"] += m["dur_ms"]
+        g["in"] += m["in"]
+        g["out"] += m["out"]
+        g["cr"] += m["cache_read"]
+        g["cc"] += m["cache_cria"]
+
+    linhas = ["", "💸 Gasto de modelo neste run (sessões claude -p — custo ≈ list price, proxy):"]
+    tot = {"n": 0, "cost": 0.0, "dur_ms": 0, "in": 0, "out": 0, "cr": 0, "cc": 0}
+    for modelo in sorted(por_modelo):
+        g = por_modelo[modelo]
+        for k in tot:
+            tot[k] += g[k]
+        entrada = g["in"] + g["cr"] + g["cc"]
+        linhas.append(
+            "   %-8s: %d sessão(ões) · $%.4f · %.0fs · in %s (cache %s) / out %s"
+            % (modelo, g["n"], g["cost"], g["dur_ms"] / 1000.0,
+               _fmt_tok(entrada), _fmt_tok(g["cr"]), _fmt_tok(g["out"])))
+    entrada_tot = tot["in"] + tot["cr"] + tot["cc"]
+    linhas.append(
+        "   ─ total : %d sessão(ões) · $%.4f · %.0fs de modelo · in %s / out %s"
+        % (tot["n"], tot["cost"], tot["dur_ms"] / 1000.0,
+           _fmt_tok(entrada_tot), _fmt_tok(tot["out"])))
+    return linhas
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +353,7 @@ def rodar_claude(prompt, pasta, log, cancel=None, modelo=None,
 
         linhas = _stream(proc, log, cancel)
         res = _extrair_result(linhas)
+        _registrar_metrica(res, modelo)  # mede o gasto de CADA tentativa (inclui retry)
         if proc.returncode == 0 and not res.get("is_error"):
             return res
 

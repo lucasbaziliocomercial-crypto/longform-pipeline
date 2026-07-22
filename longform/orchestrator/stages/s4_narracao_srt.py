@@ -392,6 +392,80 @@ def _duracao(ffmpeg, arq):
         return 0.0
 
 
+def _ritmo_alvo_min():
+    """Alvo de duração da narração em minutos (LONGFORM_NARRATION_TARGET_MIN). 0/vazio = desligado."""
+    v = os.environ.get("LONGFORM_NARRATION_TARGET_MIN", "").strip()
+    try:
+        return float(v) if v else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _atempo_chain(fator):
+    """Monta o filtro atempo do FFmpeg. Cada instância de atempo aceita 0.5..2.0; fatores maiores
+    são ENCADEADOS (atempo=2.0,atempo=...). Aqui o fator já vem clampado a <=~1.8, então sai 1 só."""
+    fator = max(0.5, fator)
+    partes = []
+    while fator > 2.0:
+        partes.append("atempo=%.4f" % 2.0); fator /= 2.0
+    partes.append("atempo=%.4f" % fator)
+    return ",".join(partes)
+
+
+def ajustar_ritmo(proj, log):
+    """Acelera a narração para caber em ~LONGFORM_NARRATION_TARGET_MIN minutos, via FFmpeg atempo
+    (time-stretch que PRESERVA o timbre — a voz continua a mesma, só fala mais rápido).
+
+    Roda DEPOIS do TTS e ANTES da otimização de pausa/Whisper, então a SRT nasce do áudio já no
+    ritmo final e fica sincronizada. É NECESSÁRIO porque o parâmetro `speed` do CapCut é um
+    playbackRate do editor e NÃO altera a duração do MP3 gerado (medido: speed 10 e 16 dão a MESMA
+    duração) — o ajuste de verdade tem de ser aqui. Só ACELERA (fator>1); nunca desacelera. Clamp por
+    LONGFORM_NARRATION_TEMPO_MAX (default 1.8) para não soar artificial. NÃO-destrutivo (guarda
+    narration_semritmo.mp3), idempotente (proj.ritmo_flag). Invalida a SRT/pausas antigas p/ o áudio novo.
+    """
+    alvo = _ritmo_alvo_min()
+    if alvo <= 0:
+        return
+    if proj.existe(proj.ritmo_flag):
+        log("    ritmo já ajustado — pulado.")
+        return
+    if not proj.existe(proj.narration_mp3):
+        return
+    ff = achar_ffmpeg()
+    dur = _duracao(ff, proj.narration_mp3)
+    if dur <= 0:
+        return
+    fator = dur / (alvo * 60.0)
+    if fator <= 1.01:
+        log("    narração já ≤ alvo (%.1f min ≤ %.0f min) — sem acelerar." % (dur / 60.0, alvo))
+        proj.ritmo_flag.write_text("alvo=%.0fmin fator=1.0 (no-op, %.1fs)\n" % (alvo, dur), encoding="utf-8")
+        return
+    maxf = float(os.environ.get("LONGFORM_NARRATION_TEMPO_MAX", "1.8"))
+    fator = min(fator, maxf)
+    if not proj.existe(proj.narration_semritmo):
+        shutil.copyfile(proj.narration_mp3, proj.narration_semritmo)
+    tmp = proj.dir / "_narration_ritmo.mp3"
+    af = _atempo_chain(fator)
+    log("▶ Etapa 4/8 — ajustando ritmo da narração p/ ~%.0f min (atempo=%.3f, preserva timbre)..."
+        % (alvo, fator))
+    proc = subprocess.run([ff, "-y", "-hide_banner", "-loglevel", "error",
+                           "-i", str(proj.narration_semritmo), "-filter:a", af,
+                           "-c:a", "libmp3lame", "-q:a", "2", str(tmp)],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, **SUBPROCESS_FLAGS)
+    if not (tmp.exists() and tmp.stat().st_size > 0):
+        err = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
+        raise ErroPipeline("Falha ao ajustar ritmo da narração (FFmpeg): %s" % (err[-300:] or "sem stderr"))
+    os.replace(str(tmp), str(proj.narration_mp3))
+    # a SRT/pausas/raw antigas nasceram do áudio no ritmo ANTIGO — invalida p/ refazer do novo.
+    for artefato in (proj.narration_srt, proj.pausas_flag, proj.narration_raw):
+        if proj.existe(artefato):
+            artefato.unlink()
+    dur2 = _duracao(ff, proj.narration_mp3)
+    proj.ritmo_flag.write_text("alvo=%.0fmin fator=%.4f antes=%.1fs depois=%.1fs\n"
+                               % (alvo, fator, dur, dur2), encoding="utf-8")
+    log("    ✓ ritmo ajustado: %.1f min → %.1f min (atempo=%.3f)." % (dur / 60.0, dur2 / 60.0, fator))
+
+
 def otimizar_pausas(proj, log):
     """Apara o EXCESSO de silêncio das pausas longas da narração (anti-robótico).
 
@@ -463,6 +537,10 @@ def run(proj, log, cancel=None, voz=None, **_):
         #      roteiro_tts.txt resultante, lendo de forma mais natural. Não-destrutivo/idempotente.
         humanizar_roteiro(proj, log, cancel)
         synthesize(proj, log, cancel, voz=voz)
+
+    # 1.4) Ajuste de ritmo (atempo) p/ caber no alvo de minutos (LONGFORM_NARRATION_TARGET_MIN) —
+    #      ANTES da pausa/Whisper, p/ a SRT nascer sincronizada. No-op se o alvo não estiver setado.
+    ajustar_ritmo(proj, log)
 
     # 1.5) Otimização de pausa (anti-robótico) — ANTES do Whisper, p/ a SRT nascer do áudio
     #      já otimizado e ficar sincronizada. Idempotente; não-destrutiva (guarda narration_raw).
