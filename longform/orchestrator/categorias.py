@@ -36,6 +36,10 @@ import os
 #   skill_thumb_override = skill com a ESPECIFICAÇÃO DE CAPA específica da categoria, injetada
 #                          como OVERRIDE na Etapa 5 (precedência sobre o formato selena da skill
 #                          compartilhada). None = usa o formato padrão (Selena) da skill.
+#   alvo_palavras        = alvo de PALAVRAS do roteiro (Etapa 2). Máfia mira 7500 (~50 min);
+#                          AUSENTE = PADRAO_ALVO_PALAVRAS (5000 = Selena/~35 min). A env GLOBAL
+#                          LONGFORM_ALVO_PALAVRAS (tratada no s2_roteiro) sobrescreve isto quando
+#                          setada. Lido por `alvo_palavras()`.
 #   youtube_canal        = nome legível do CANAL do YouTube da categoria (logs + painel de
 #                          publicação). Neste repo a categoria É o canal (1 List = 1 canal).
 #   adspower_user_id     = ID do perfil no AdsPower (um perfil anti-detecção por canal, com
@@ -64,6 +68,7 @@ CATEGORIAS = {
         "spaces": "",
         "aliases": ("mafia", "máfia", "mafia automacao", "máfia automação",
                     "máfia (automação)"),
+        "alvo_palavras": 7500,               # Máfia: roteiro long-form 7-8k (~50 min)
         "skill_roteiro": "longform-roteiro-mafia",
         "skill_thumb_override": "longform-thumb-mafia",
         "youtube_canal": "Máfia",
@@ -91,6 +96,7 @@ CATEGORIAS = {
         "spaces": "",
         "aliases": ("mafia 2", "máfia 2", "mafia2", "mafia-2", "máfia-2", "2 mafia",
                     "2- máfia", "2- mafia", "2- máfia (inicio 10/07)"),
+        "alvo_palavras": 7500,               # Máfia: roteiro long-form 7-8k (~50 min)
         "skill_roteiro": "longform-roteiro-mafia",
         "skill_thumb_override": "longform-thumb-mafia",
         "youtube_canal": "Máfia 2",
@@ -104,6 +110,7 @@ CATEGORIAS = {
         "spaces": "",
         "aliases": ("mafia 3", "máfia 3", "mafia3", "mafia-3", "máfia-3", "3 mafia",
                     "3- máfia", "3- mafia", "3- máfia (inicio 10/07)"),
+        "alvo_palavras": 7500,               # Máfia: roteiro long-form 7-8k (~50 min)
         "skill_roteiro": "longform-roteiro-mafia",
         "skill_thumb_override": "longform-thumb-mafia",
         "youtube_canal": "Máfia 3",
@@ -117,6 +124,7 @@ CATEGORIAS = {
         "spaces": "",
         "aliases": ("mafia 4", "máfia 4", "mafia4", "mafia-4", "máfia-4", "4 mafia",
                     "4- máfia", "4- mafia", "4- máfia (inicio 10/07)"),
+        "alvo_palavras": 7500,               # Máfia: roteiro long-form 7-8k (~50 min)
         "skill_roteiro": "longform-roteiro-mafia",
         "skill_thumb_override": "longform-thumb-mafia",
         "youtube_canal": "Máfia 4",
@@ -126,6 +134,9 @@ CATEGORIAS = {
 }
 
 PADRAO = "selena"
+# Alvo de palavras do roteiro quando a categoria não declara `alvo_palavras` (Selena/Alpha King,
+# ~35 min). Máfia sobrescreve com 7500 no dict acima. Env global LONGFORM_ALVO_PALAVRAS vence tudo.
+PADRAO_ALVO_PALAVRAS = 5000
 
 
 def _norm(s):
@@ -171,6 +182,18 @@ def skill_roteiro(nome=None):
     Default seguro "longform-roteiro" (Selena) p/ categoria sem o campo configurado."""
     cfg = config_de(nome if nome is not None else atual())
     return cfg.get("skill_roteiro") or "longform-roteiro"
+
+
+def alvo_palavras(nome=None):
+    """Alvo de PALAVRAS do roteiro (Etapa 2) da categoria (default = a atual no ambiente).
+    Máfia mira 7500 (~50 min); categorias sem o campo caem em PADRAO_ALVO_PALAVRAS (5000,
+    Selena/~35 min). NÃO trata a env global LONGFORM_ALVO_PALAVRAS — essa precedência é do
+    s2_roteiro (override global, vale p/ todas as categorias)."""
+    cfg = config_de(nome if nome is not None else atual())
+    try:
+        return max(500, int(cfg.get("alvo_palavras") or PADRAO_ALVO_PALAVRAS))
+    except (TypeError, ValueError):
+        return PADRAO_ALVO_PALAVRAS
 
 
 def skill_thumb_override(nome=None):

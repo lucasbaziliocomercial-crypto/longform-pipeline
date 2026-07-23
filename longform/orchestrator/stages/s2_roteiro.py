@@ -21,16 +21,31 @@ MODELO_TRADUZIR = os.environ.get("LONGFORM_MODELO_TRADUZIR", "sonnet").strip() o
 # Caracteres típicos do português que praticamente não aparecem em inglês — base da detecção.
 _PT_CHARS = "ãõçáéíóúâêôàü"
 
-# Alvo de tamanho do roteiro, configurável por env LONGFORM_ALVO_PALAVRAS (default 5000 = ~40 min
-# na voz natural da Joanne). Baixe (ex.: 3200 ≈ ~25 min) p/ vídeos mais curtos SEM acelerar a fala —
-# o TAMANHO do roteiro é o que controla a duração em ritmo natural. A skill recebe o alvo via
+# Alvo de tamanho do roteiro. Precedência: env LONGFORM_ALVO_PALAVRAS (override GLOBAL — vale p/
+# TODAS as categorias) > alvo POR CATEGORIA (categorias.alvo_palavras — Máfia 7500 ~50 min, Selena
+# 5000 ~35 min). Baixe o alvo (ex.: 3200 ≈ ~25 min) p/ vídeos mais curtos SEM acelerar a fala — o
+# TAMANHO do roteiro é o que controla a duração em ritmo natural. A skill recebe o alvo via
 # _ctx_base e mira ele na 1ª passada. MIN/MAX = faixa ±~6% (MIN é o piso do loop de expansão).
-try:
-    ALVO_PALAVRAS = max(500, int(os.environ.get("LONGFORM_ALVO_PALAVRAS", "5000")))
-except (TypeError, ValueError):
-    ALVO_PALAVRAS = 5000
-MIN_PALAVRAS = int(round(ALVO_PALAVRAS * 0.94))
-MAX_PALAVRAS = int(round(ALVO_PALAVRAS * 1.06))
+_FRACAO_MIN, _FRACAO_MAX = 0.94, 1.06
+
+
+def _alvo_palavras():
+    """Alvo de palavras a mirar: env global LONGFORM_ALVO_PALAVRAS vence; senão, o alvo da
+    categoria atual (categorias.alvo_palavras)."""
+    env = os.environ.get("LONGFORM_ALVO_PALAVRAS")
+    if env not in (None, ""):
+        try:
+            return max(500, int(env))
+        except (TypeError, ValueError):
+            pass
+    return max(500, categorias.alvo_palavras())
+
+
+def _faixa(alvo):
+    """(MIN, MAX) da banda ±~6% em torno do alvo."""
+    return int(round(alvo * _FRACAO_MIN)), int(round(alvo * _FRACAO_MAX))
+
+
 MAX_EXPANSOES = 1   # era 2. Cada expansão é um claude -p Opus completo (~6-9 min); a usuária
                     # priorizou velocidade. O _ctx_base agora exige acertar o tamanho NA 1ª passada,
                     # então 1 expansão é rede de segurança. Suba se o roteiro sair curto com frequência.
@@ -50,21 +65,21 @@ def _instr_idioma():
     )
 
 
-def _ctx_base(proj, alvo):
+def _ctx_base(proj, alvo, minp, maxp):
     src = json.loads(proj.source.read_text(encoding="utf-8"))
     return (
         "FONTE (Etapa 1 — ClickUp), use como base da história:\n"
         "TÍTULO: %s\n"
         "PREMISSA:\n%s\n\n"
         "%s"
-        "ALVO DE TAMANHO: ~%d palavras (faixa %d–%d), narração contínua de ~35 min, "
+        "ALVO DE TAMANHO: ~%d palavras (faixa %d–%d), narração contínua longa, "
         "formato YouTube long-form 16:9. CRÍTICO: entregue o roteiro JÁ NO TAMANHO-ALVO na "
         "PRIMEIRA passada (não devolva curto contando com expansão depois) — escreva todas as "
         "cenas com profundidade de diálogo e detalhe sensorial suficientes para fechar a faixa. "
         "SALVE o roteiro final como `roteiro.txt` "
         "(texto puro, sem markdown, sem cabeçalhos de cena no meio da prosa narrada)."
         % (src.get("titulo", ""), src.get("premissa", ""), _instr_idioma(),
-           alvo, MIN_PALAVRAS, MAX_PALAVRAS)
+           alvo, minp, maxp)
     )
 
 
@@ -91,7 +106,7 @@ def _ctx_expandir(faltam, palavras_atual, alvo):
     )
 
 
-def run(proj, log, cancel=None, alvo=ALVO_PALAVRAS, **_):
+def run(proj, log, cancel=None, alvo=None, **_):
     if proj.existe(proj.roteiro):
         n = contar_palavras(proj.roteiro.read_text(encoding="utf-8", errors="replace"))
         log("    roteiro.txt já existe (%d palavras) — Etapa 2 pulada." % n)
@@ -104,9 +119,12 @@ def run(proj, log, cancel=None, alvo=ALVO_PALAVRAS, **_):
     if skill_slot_vazio(skill):
         log("    ⚠ A skill de roteiro da categoria (%s) está com o PROMPT MESTRE em branco "
             "('(inserir)') — preencha-a antes de gerar (o roteiro sairá genérico)." % skill)
-    log("▶ Etapa 2/8 — Roteiro (~%d palavras, %s, effort=%s, idioma=%s, skill=%s)..."
-        % (alvo, MODELO_ROTEIRO, EFFORT_ROTEIRO or "default", nome_idioma(), skill))
-    rodar_claude(montar_prompt(skill, _ctx_base(proj, alvo)),
+    if alvo is None:
+        alvo = _alvo_palavras()
+    minp, maxp = _faixa(alvo)
+    log("▶ Etapa 2/8 — Roteiro (~%d palavras [%d–%d], %s, effort=%s, idioma=%s, skill=%s)..."
+        % (alvo, minp, maxp, MODELO_ROTEIRO, EFFORT_ROTEIRO or "default", nome_idioma(), skill))
+    rodar_claude(montar_prompt(skill, _ctx_base(proj, alvo, minp, maxp)),
                  proj.dir, log, cancel, modelo=MODELO_ROTEIRO, effort=EFFORT_ROTEIRO)
     if not proj.existe(proj.roteiro):
         raise ErroPipeline("Etapa 2 não gerou roteiro.txt.")
@@ -114,8 +132,8 @@ def run(proj, log, cancel=None, alvo=ALVO_PALAVRAS, **_):
     # Loop de expansão até o mínimo.
     for tent in range(MAX_EXPANSOES):
         n = contar_palavras(proj.roteiro.read_text(encoding="utf-8", errors="replace"))
-        if n >= MIN_PALAVRAS:
-            log("    ✓ Roteiro com %d palavras (>= mínimo %d)." % (n, MIN_PALAVRAS))
+        if n >= minp:
+            log("    ✓ Roteiro com %d palavras (>= mínimo %d)." % (n, minp))
             return
         faltam = alvo - n
         log("    Roteiro curto (%d/%d). Expansão %d/%d (prompt enxuto, sem reenviar a skill)..."
@@ -124,9 +142,9 @@ def run(proj, log, cancel=None, alvo=ALVO_PALAVRAS, **_):
                      proj.dir, log, cancel, modelo=MODELO_ROTEIRO, effort=EFFORT_ROTEIRO)
 
     n = contar_palavras(proj.roteiro.read_text(encoding="utf-8", errors="replace"))
-    if n < MIN_PALAVRAS:
+    if n < minp:
         log("    ⚠ Roteiro com %d palavras após %d expansões (abaixo de %d) — seguindo; "
-            "o validador pode reforçar." % (n, MAX_EXPANSOES, MIN_PALAVRAS))
+            "o validador pode reforçar." % (n, MAX_EXPANSOES, minp))
 
 
 def _idioma_do_texto(txt):
