@@ -241,6 +241,171 @@ def _args_video_final():
             "-maxrate", maxrate, "-bufsize", bufsize, "-pix_fmt", "yuv420p"]
 
 
+# ── Overlay de PARTÍCULAS (poeira flutuante) sobre o vídeo — "floating dust" ──────────────
+# A usuária pediu a partícula que fica POR CIMA do vídeo todo (aquele "chuvisco" de poeira que
+# aparece nas sombras e some nas altas-luzes, como nos canais de dark-romance). Reproduzimos com
+# um overlay de poeira flutuante composto em modo SCREEN: no preto o screen não soma nada (a
+# partícula some no claro) e nas sombras ela aparece — exatamente o comportamento observado.
+#
+# O overlay é GERADO pelo próprio FFmpeg (procedural, sem asset externo) e CACHEADO em
+# longform/assets/overlays/ — gera uma vez, reusa em todo render. É um loop curto (~16 s) de
+# motas macias derivando em ping-pong por cosseno (sem "costura"/seam e fechando o loop perfeito),
+# depois `-stream_loop -1` cobre o vídeo inteiro. Aplicado nos encodes FINAIS que já re-encodam o
+# vídeo (finalizar_video do engine 'dynamic'/'ffmpeg-galeria' e queimar_legendas do --burn-subs),
+# SEMPRE por baixo da legenda (a legenda fica nítida por cima). Determinístico (seed fixo do noise).
+#
+# Envs: LONGFORM_PARTICULAS=0 desliga; _OPACIDADE (0..1, default 0.30) = força do screen;
+#       _ASSET aponta um pack próprio (pula a geração); _LOOP_SEC (default 16) e _SEED calibram
+#       a geração. O overlay é gerado numa base 1920x1080 e re-escalado ao vídeo real no encode.
+_PART_BASE_W, _PART_BASE_H = 1920, 1080  # base da geração (re-escalada ao vídeo real via scale)
+_VERDADEIRO_PART = ("1", "on", "true", "sim", "yes")
+
+
+def _particulas_on():
+    return (os.environ.get("LONGFORM_PARTICULAS", "1") or "1").strip().lower() in _VERDADEIRO_PART
+
+
+def _particulas_opacidade():
+    """Força do screen (0..1). Default 0.30 — sutil, some no claro e aparece nas sombras."""
+    op = _envf("LONGFORM_PARTICULAS_OPACIDADE", 0.30)
+    return max(0.0, min(1.0, op))
+
+
+def _particulas_loop_sec():
+    try:
+        return max(4, int(os.environ.get("LONGFORM_PARTICULAS_LOOP_SEC", "16")))
+    except (TypeError, ValueError):
+        return 16
+
+
+def _particulas_seed():
+    try:
+        return int(os.environ.get("LONGFORM_PARTICULAS_SEED", "101"))
+    except (TypeError, ValueError):
+        return 101
+
+
+def _assets_overlays_dir():
+    """longform/assets/overlays/ (a partir de longform/orchestrator/ffmpeg_montagem.py)."""
+    return Path(__file__).resolve().parent.parent / "assets" / "overlays"
+
+
+def _ffprobe_bin(ffmpeg):
+    """ffprobe irmão do ffmpeg (ffprobe/ffprobe.exe), com fallback pro PATH."""
+    p = Path(ffmpeg)
+    for nome in ("ffprobe", "ffprobe.exe"):
+        cand = p.with_name(nome)
+        if cand.exists():
+            return str(cand)
+    return shutil.which("ffprobe") or shutil.which("ffprobe.exe") or "ffprobe"
+
+
+def _dim_video(ffmpeg, path):
+    """(w, h) do vídeo via ffprobe; cai em (1920, 1080) se não der p/ ler."""
+    try:
+        r = subprocess.run([_ffprobe_bin(ffmpeg), "-v", "error", "-select_streams", "v:0",
+                            "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0",
+                            str(path)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           universal_newlines=True, **SUBPROCESS_FLAGS)
+        w, h = (r.stdout or "").strip().split("x")
+        return int(w), int(h)
+    except (ValueError, OSError):
+        return (_PART_BASE_W, _PART_BASE_H)
+
+
+def _gerar_overlay_particulas(ffmpeg, base_w, base_h, loop_sec, seed):
+    """Gera (ou reusa do cache) o loop de poeira flutuante -> Path do .mp4. Determinístico.
+
+    Passo 1: campo de MOTAS estáticas em 2 camadas (grandes+macias e finas) num canvas MAIOR que
+    o vídeo (margem p/ o pan) — ruído gaussiano semeado, cortado esparso (lut) e borrado (gblur),
+    combinado em SCREEN -> _bigdust.png. Passo 2: pan em PING-PONG por cosseno dentro desse canvas
+    (x/y = margem*(0.5-0.5*cos(2πt/loop)) com fase distinta no y) -> loop que deriva "flutuando" e
+    FECHA sem costura (o cosseno volta a 0 no fim). Sem tiles/wrap = sem seam. Saída cinza (o screen
+    só soma luz). Falha na geração NÃO derruba o render (o chamador segue sem partícula)."""
+    d = _assets_overlays_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    alvo = d / ("dust_particles_v2_%dx%d_%ds_s%d.mp4" % (base_w, base_h, loop_sec, seed))
+    if alvo.is_file() and alvo.stat().st_size > 1000:
+        return alvo
+    cw = base_w + base_w * 27 // 100   # canvas ~1.27x (margem p/ o pan sem sair da imagem)
+    ch = base_h + base_h * 27 // 100
+    mx, my = cw - base_w, ch - base_h  # amplitude do pan (a margem disponível)
+    aw, ah = max(16, cw // 15), max(16, ch // 15)  # baixa-res da camada A (motas grandes e macias)
+    bw, bh = max(16, cw // 8), max(16, ch // 8)     # baixa-res da camada B (pontos finos)
+    seed_b = seed + 101
+    tmp_png = d / ("_bigdust_%dx%d_s%d.png" % (base_w, base_h, seed))
+    # Densidade calibrada p/ ficar ESPARSA como a referência (poeira espaçada, não "chuvisco denso"):
+    # camada A = poucas motas grandes (thr 96, blur forte); camada B = pontos finos e RALOS (thr 99).
+    fc1 = ("[0]format=gray,noise=alls=100:allf=t:all_seed=%d,lut=y='if(gt(val,96),255,0)',"
+           "scale=%dx%d:flags=gauss,gblur=sigma=11:steps=3,eq=contrast=1.5[a];"
+           "[1]format=gray,noise=alls=100:allf=t:all_seed=%d,lut=y='if(gt(val,99),255,0)',"
+           "scale=%dx%d:flags=gauss,gblur=sigma=2.6:steps=2[b];"
+           "[a][b]blend=all_mode=screen,format=gray[v]") % (seed, cw, ch, seed_b, cw, ch)
+    cmd1 = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "color=c=black:s=%dx%d:r=1" % (aw, ah),
+            "-f", "lavfi", "-i", "color=c=black:s=%dx%d:r=1" % (bw, bh),
+            "-filter_complex", fc1, "-map", "[v]", "-frames:v", "1", str(tmp_png)]
+    fc2 = ("[0:v]crop=%d:%d:x='%d*(0.5-0.5*cos(2*PI*t/%d))':"
+           "y='%d*(0.5-0.5*cos(2*PI*t/%d+1.7))',fps=30,format=gray[v]"
+           ) % (base_w, base_h, mx, loop_sec, my, loop_sec)
+    cmd2 = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+            "-loop", "1", "-t", str(loop_sec), "-i", str(tmp_png),
+            "-filter_complex", fc2, "-map", "[v]",
+            "-c:v", "libx264", "-pix_fmt", "gray", "-crf", "18", "-t", str(loop_sec), str(alvo)]
+    print(">> Gerando overlay de partículas (poeira flutuante %dx%d, loop %ds) — uma vez, cacheado."
+          % (base_w, base_h, loop_sec), flush=True)
+    for cmd in (cmd1, cmd2):
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           universal_newlines=True, encoding="utf-8", errors="replace",
+                           **SUBPROCESS_FLAGS)
+        if r.returncode != 0:
+            try:
+                tmp_png.unlink()
+            except OSError:
+                pass
+            raise ErroPipeline("ffmpeg falhou ao gerar overlay de partículas:\n%s"
+                               % "\n".join((r.stdout or "").splitlines()[-6:]))
+    try:
+        tmp_png.unlink()
+    except OSError:
+        pass
+    return alvo
+
+
+def _overlay_particulas(ffmpeg):
+    """Resolve o overlay de partículas a usar -> Path (ou None se desligado/indisponível).
+
+    Ordem: env desliga -> asset próprio (LONGFORM_PARTICULAS_ASSET) -> geração procedural cacheada.
+    Nunca levanta: falha vira None (o render segue sem partícula, com aviso)."""
+    if not _particulas_on():
+        return None
+    override = os.environ.get("LONGFORM_PARTICULAS_ASSET")
+    if override:
+        p = Path(override).expanduser()
+        if p.is_file():
+            return p
+        print("AVISO: LONGFORM_PARTICULAS_ASSET não existe (%s) — gerando procedural." % override,
+              flush=True)
+    try:
+        return _gerar_overlay_particulas(ffmpeg, _PART_BASE_W, _PART_BASE_H,
+                                         _particulas_loop_sec(), _particulas_seed())
+    except (ErroPipeline, OSError) as e:
+        print("AVISO: não consegui preparar o overlay de partículas (%s) — seguindo SEM." % e,
+              flush=True)
+        return None
+
+
+def _frag_particulas(overlay_idx, in_label, out_label, w, h):
+    """Fragmento filter_complex: escala o overlay [overlay_idx] ao vídeo (w x h) e faz SCREEN
+    sobre [in_label] -> [out_label]. Em rgb24 (screen soma luz por canal: preto=nada, branco=+)."""
+    op = _particulas_opacidade()
+    inl, outl = in_label.strip("[]"), out_label.strip("[]")
+    return ("[%d:v]scale=%d:%d,setsar=1,format=rgb24[ovp];"
+            "[%s]format=rgb24[bgp];"
+            "[bgp][ovp]blend=all_mode=screen:all_opacity=%.3f,format=yuv420p[%s]"
+            ) % (overlay_idx, w, h, inl, op, outl)
+
+
 # ── Limpeza + volume do áudio (tudo via FFmpeg, NÃO-destrutivo) ──
 # A narração de TTS sai com ruído de banda larga (hiss) + artefatos de MP3 de bitrate baixo.
 # No mux montamos uma cadeia FFmpeg em 2 BLOCOS, nesta ordem:
@@ -802,15 +967,28 @@ def queimar_legendas(entrada, srt, out):
         raise SystemExit("ERRO: legenda (.srt) não existe: %s" % srt)
     ffmpeg = achar_ffmpeg()
     out.parent.mkdir(parents=True, exist_ok=True)
+    # Overlay de partículas (poeira flutuante) POR BAIXO da legenda. None = desligado -> caminho antigo.
+    overlay = _overlay_particulas(ffmpeg)
     ass = _preparar_ass(ffmpeg, srt, CAPTION_MAX_CHARS)
     try:
-        vf = "subtitles=%s:force_style='%s'" % (ass.name, LEGENDA_STYLE)
-        cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-stats",
-               "-i", str(entrada), "-vf", vf,
-               *_args_video_final(), "-c:a", "copy", str(out)]
         cap = "off (master s/ teto)" if _final_bitrate_off() else ("teto %s" % FINAL_BITRATE)
-        _run(cmd, "Queimando legendas (~%d car./linha, %s, bitrate %s)"
-             % (CAPTION_MAX_CHARS, srt.name, cap), cwd=str(srt.parent))
+        if overlay is not None:
+            w, h = _dim_video(ffmpeg, entrada)
+            filtro = (_frag_particulas(1, "0:v", "vp", w, h)
+                      + ";[vp]subtitles=%s:force_style='%s'[vout]" % (ass.name, LEGENDA_STYLE))
+            cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-stats",
+                   "-i", str(entrada), "-stream_loop", "-1", "-i", str(overlay),
+                   "-filter_complex", filtro, "-map", "[vout]", "-map", "0:a:0?",
+                   *_args_video_final(), "-c:a", "copy", str(out)]
+            _run(cmd, "Queimando legendas + partículas (~%d car./linha, %s, op=%.2f, bitrate %s)"
+                 % (CAPTION_MAX_CHARS, srt.name, _particulas_opacidade(), cap), cwd=str(srt.parent))
+        else:
+            vf = "subtitles=%s:force_style='%s'" % (ass.name, LEGENDA_STYLE)
+            cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-stats",
+                   "-i", str(entrada), "-vf", vf,
+                   *_args_video_final(), "-c:a", "copy", str(out)]
+            _run(cmd, "Queimando legendas (~%d car./linha, %s, bitrate %s)"
+                 % (CAPTION_MAX_CHARS, srt.name, cap), cwd=str(srt.parent))
     finally:
         try:
             ass.unlink()
@@ -842,37 +1020,67 @@ def finalizar_video(video, audio, out, srt=None):
     rotulo_audio = ("limpeza=%s, vol=%s LUFS" % (nivel, AUDIO_LUFS)) if af else "off (áudio cru)"
     base_cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-stats"]
 
-    if srt is not None:
-        srt = Path(srt).resolve()
-        if not srt.is_file():
-            raise SystemExit("ERRO: legenda (.srt) não existe: %s" % srt)
-        ass = _preparar_ass(ffmpeg, srt, CAPTION_MAX_CHARS)
-        try:
-            vf = "subtitles=%s:force_style='%s'" % (ass.name, LEGENDA_STYLE)
+    # Overlay de partículas (poeira flutuante) POR CIMA do vídeo, por baixo da legenda. None =
+    # desligado/indisponível (aí o caminho é idêntico ao antigo). Ver _overlay_particulas.
+    overlay = _overlay_particulas(ffmpeg)
+    ov_idx = None
+    extra_in = []
+    if overlay is not None:
+        w, h = _dim_video(ffmpeg, video)
+        extra_in = ["-stream_loop", "-1", "-i", str(overlay)]  # cobre o vídeo todo (loop curto)
+        ov_idx = 2  # inputs: 0=vídeo mudo, 1=narração, 2=overlay
+
+    srt_ass = None
+    srt_cwd = None
+    try:
+        # Cadeia de vídeo: partículas (screen) -> legenda (subtitles). Cada etapa é opcional.
+        frags = []
+        cur = "0:v"
+        if ov_idx is not None:
+            frags.append(_frag_particulas(ov_idx, cur, "vp", w, h))
+            cur = "vp"
+        if srt is not None:
+            srt = Path(srt).resolve()
+            if not srt.is_file():
+                raise SystemExit("ERRO: legenda (.srt) não existe: %s" % srt)
+            srt_ass = _preparar_ass(ffmpeg, srt, CAPTION_MAX_CHARS)
+            srt_cwd = str(srt.parent)
+            frags.append("[%s]subtitles=%s:force_style='%s'[vout]"
+                         % (cur, srt_ass.name, LEGENDA_STYLE))
+            cur = "vout"
+
+        cap = "off (master s/ teto)" if _final_bitrate_off() else ("teto %s" % FINAL_BITRATE)
+        part_txt = (", partículas op=%.2f" % _particulas_opacidade()) if ov_idx is not None else ""
+
+        if frags:
+            # Há filtro de vídeo (partículas e/ou legenda) -> filter_complex + re-encode.
+            filtro = ";".join(frags)
+            cmd = base_cmd + ["-i", str(video), "-i", str(audio), *extra_in,
+                              "-filter_complex", filtro,
+                              "-map", "[%s]" % cur, "-map", "1:a:0",
+                              *_args_video_final(), *af_args, *_args_audio_saida(),
+                              "-shortest", str(out)]
+            legenda_txt = ("legenda %s" % srt.name) if srt is not None else "sem legenda"
+            _run(cmd, "Finalizar dynamic (mux narração [%s] + %s%s, bitrate %s)"
+                 % (rotulo_audio, legenda_txt, part_txt, cap), cwd=srt_cwd)
+        else:
+            # Sem partícula e sem legenda: comportamento antigo (copia o vídeo, ou re-encoda só
+            # p/ aplicar o teto de bitrate — o mudo é um master CQ sem teto).
+            if _final_bitrate_off():
+                vargs, rotulo_v = ["-c:v", "copy"], "vídeo copiado (master s/ teto)"
+            else:
+                vargs, rotulo_v = _args_video_final(), "vídeo c/ teto %s" % FINAL_BITRATE
             cmd = base_cmd + ["-i", str(video), "-i", str(audio),
                               "-map", "0:v:0", "-map", "1:a:0",
-                              "-vf", vf, *_args_video_final(), *af_args, *_args_audio_saida(),
+                              *vargs, *af_args, *_args_audio_saida(),
                               "-shortest", str(out)]
-            cap = "off (master s/ teto)" if _final_bitrate_off() else ("teto %s" % FINAL_BITRATE)
-            _run(cmd, "Finalizar dynamic (mux narração [%s] + legenda %s, bitrate %s)"
-                 % (rotulo_audio, srt.name, cap), cwd=str(srt.parent))
-        finally:
+            _run(cmd, "Finalizar dynamic (mux narração [%s], %s)" % (rotulo_audio, rotulo_v))
+    finally:
+        if srt_ass is not None:
             try:
-                ass.unlink()
+                srt_ass.unlink()
             except OSError:
                 pass
-    else:
-        # Sem legenda: se o teto estiver LIGADO, re-encoda o vídeo p/ encolher (o mudo é um
-        # master CQ sem teto); se OFF, mantém o barato -c:v copy (comportamento antigo).
-        if _final_bitrate_off():
-            vargs, rotulo_v = ["-c:v", "copy"], "vídeo copiado (master s/ teto)"
-        else:
-            vargs, rotulo_v = _args_video_final(), "vídeo c/ teto %s" % FINAL_BITRATE
-        cmd = base_cmd + ["-i", str(video), "-i", str(audio),
-                          "-map", "0:v:0", "-map", "1:a:0",
-                          *vargs, *af_args, *_args_audio_saida(),
-                          "-shortest", str(out)]
-        _run(cmd, "Finalizar dynamic (mux narração [%s], %s)" % (rotulo_audio, rotulo_v))
     print("final.mp4 (dynamic) gravado em: %s" % out, flush=True)
 
 

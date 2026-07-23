@@ -31,6 +31,11 @@ longform/**/out/
 longform/**/dist/
 longform/remotion/public/
 
+# overlay de PARTÍCULAS (poeira flutuante): cache GERADO pelo ffmpeg, determinístico e
+# recriado on-demand na 1ª montagem (ver _gerar_overlay_particulas em ffmpeg_montagem.py).
+longform/assets/overlays/*.mp4
+longform/assets/overlays/_bigdust*.png
+
 # SEGREDOS — nunca versionar (o .example fica como template)
 longform/longform.env
 longform/tts/CapCut-TTS/.env
